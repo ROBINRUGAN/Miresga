@@ -1,13 +1,13 @@
-echo 1 | tee /sys/class/net/enp197s0f1np1/device/sriov_numvfs
-echo 1 | tee /sys/class/net/enp173s0f0np0/device/sriov_numvfs
+echo 1 | tee /sys/class/net/enp197s0f1/device/sriov_numvfs
+echo 1 | tee /sys/class/net/enp173s0f0/device/sriov_numvfs
 ip netns add frontend_1
 ip netns add frontend_2
-ip link set enp197s0f1np1 netns frontend_1
+ip link set enp197s0f1 netns frontend_1
 ip link set enp197s0f1v0  netns frontend_1
-ip link set enp173s0f0np0 netns frontend_2
+ip link set enp173s0f0 netns frontend_2
 ip link set enp173s0f0v0  netns frontend_2
-ip netns exec frontend_1 ifconfig enp197s0f1np1 up
-ip netns exec frontend_2 ifconfig enp173s0f0np0 up
+ip netns exec frontend_1 ifconfig enp197s0f1 up
+ip netns exec frontend_2 ifconfig enp173s0f0 up
 ip netns exec frontend_1 ifconfig enp197s0f1v0 up
 ip netns exec frontend_2 ifconfig enp173s0f0v0 up
 ip netns exec frontend_1 ifconfig enp197s0f1v0 10.0.1.252/24

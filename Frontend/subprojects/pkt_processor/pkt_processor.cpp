@@ -31,6 +31,7 @@ uint8_t pkt_processor_t::calculate_crc8(uint32_t ip, uint16_t port) {
 char *pkt_processor_t::parse_payload(char *payload, int payload_size, int &size) {
     size = -1;
     int i = 0;
+    // payload的格式为：GET /url HTTP/1.1
     while(i < payload_size && payload[i] != '/') {
         ++i;
     }
@@ -51,6 +52,8 @@ status_t pkt_processor_t::process_pkts(rte_mbuf **recv_pkts, size_t pkt_num) {
     #endif
     rte_mbuf *send_pkts[2 * pkt_num];
     size_t send_size = 0;
+    // 1. 从mbuf_pool中分配2 * pkt_num个rte_mbuf结构体，分配成功则返回0，否则返回-1
+    // 2. 分配成功后，将分配的rte_mbuf结构体的指针存储在send_pkts数组中
     if(rte_pktmbuf_alloc_bulk(mbuf_pool, send_pkts, 2 * pkt_num) != 0) {
         return status_t::INTERNAL_ERROR;
     }
@@ -683,6 +686,7 @@ int pkt_processor_t::worker_run_warpper(void *args) {
 
 void pkt_processor_t::run(int core_id) {
     exit_flag = false;
+    // 创建线程
     rte_eal_remote_launch(&pkt_processor_t::worker_run_warpper, this, core_id);
 }
 

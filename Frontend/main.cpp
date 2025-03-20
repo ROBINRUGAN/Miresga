@@ -1,7 +1,7 @@
-#include <nlohmann/json.hpp>
-#include <sys/epoll.h>
-#include <sys/timerfd.h>
-#include <numa.h>
+#include <nlohmann/json.hpp>  // JSON 解析库
+#include <sys/epoll.h>        // epoll 用于监听多路 IO 事件，用于同时监控多个文件描述符（socket、timer 等）的可读写状态
+#include <sys/timerfd.h>      // timerfd 用于定时器文件描述符
+#include <numa.h>             // NUMA 相关操作
 #include <iostream>
 #include <fstream>
 #include "pkt_processor.hpp"
@@ -9,29 +9,37 @@
 #include "my_config.hpp"
 #include "concurrentqueue/concurrentqueue.h"
 
-using json = nlohmann::json;
+using json = nlohmann::json; //xx JSON 解析库的别名
 
 int main(int argc, char *argv[]) {
-    
 
+    // 1. 读取 config.json 配置文件
     std::ifstream total_config(CONFIG_PATH);
     json config;
-    total_config >> config;
+    total_config >> config; // 将 JSON 文件反序列化到 config 对象
+
+    // 2. 从 config 对象中读取配置信息
     std::string local_ip = config["local_ip"];
     uint32_t local_switch_port = config["local_switch_port"];
     std::string switch_ip = config["switch_ip"];
     uint32_t switch_port = config["switch_port"];
+
+    // 3. 根据配置文件中的 pkt_processor_core_ids 分配处理器核心
     std::vector<int> pkt_processor_core_ids;
+
+    // 4. 检查并设置 NUMA 节点（若系统支持 NUMA）
     if (config.contains("numa_node")) {
         std::string numa_node = config["numa_node"];
         if(numa_available() == -1) {
             std::cerr << "NUMA is not available" << std::endl;
             return -1;
         }
-        
-        numa_set_bind_policy(1);
-        numa_bind(numa_parse_nodestring(numa_node.c_str()));
+        // 设置 NUMA 策略
+        numa_set_bind_policy(1); // 1 表示使用 NUMA 策略
+        numa_bind(numa_parse_nodestring(numa_node.c_str())); // 绑定 NUMA 节点
     }
+ 
+    // 5. 从配置文件中读取 pkt_processor_core_ids,支持单个处理器核心或多个处理器核心
     auto res = config["pkt_processor_core_ids"];
     if(res.is_array()) {
         int size = res.size();
@@ -52,11 +60,14 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    total_config.close();
+    total_config.close();// 关闭配置文件
     
+    // 6. 读取 DPDK 配置文件，初始化 DPDK 配置参数，
+    // 包括网卡地址、接收队列大小、发送队列大小、mbuf 数量、mbuf 缓存大小、mbuf 数据区大小、burst 大小
     std::ifstream dpdk_config(DPDK_CONFIG_PATH);
     json dpdk_config_json;
     dpdk_config >> dpdk_config_json;
+
     dpdk_config_t dpdk_config_args;
     dpdk_config_args.pci_addr = (char *)dpdk_config_json["pci_addr"].get<std::string>().c_str();
     dpdk_config_args.rx_ring_size = dpdk_config_json["rx_ring_size"];
@@ -65,69 +76,85 @@ int main(int argc, char *argv[]) {
     dpdk_config_args.mbuf_cache_size = dpdk_config_json["mbuf_cache_size"]; 
     dpdk_config_args.mbuf_data_room_size = dpdk_config_json["mbuf_data_room_size"]; 
     dpdk_config_args.burst_size = dpdk_config_json["burst_size"];   
+
     dpdk_config_args.queue_size = pkt_processor_core_ids.size();
     std::cout << dpdk_config_args.queue_size << std::endl;
     dpdk_config.close();
 
-    int epoll_fd = epoll_create1(0);
+    // 7. 创建 epoll，用于后续监听 socket、timer 等事件
+    int epoll_fd = epoll_create1(0); // 创建 epoll 文件描述符，填写0表示使用默认参数，返回值为 epoll 文件描述符
     if(epoll_fd == -1) {
         perror("epoll_create1");
         return -1;
     }
 
+    // 8. 创建一个流量记录的哈希表（libcuckoo 哈希表，256 个分片），用于记录流量信息
     libcuckoo::cuckoohash_map<uint64_t, flow_data_t *> flow_hash_map[256];
     
+    // 9. 初始化 rule_controller（处理规则增删改）
     std::cout << "Rule controller initializing" << std::endl;
     rule_controller_t *rule_controller = new rule_controller_t;
     std::cout << "Rule controller initialized" << std::endl;
 
+    // 10. 初始化 entry_controller（处理流表增删改）
     std::cout << "Entry controller initializing" << std::endl;
     moodycamel::ConcurrentQueue<my_pair_t> *add_queue = new moodycamel::ConcurrentQueue<my_pair_t>;
     moodycamel::ConcurrentQueue<my_key_t> *del_queue = new moodycamel::ConcurrentQueue<my_key_t>;
+    // shared_ptr是一个智能指针，用于管理指针的生命周期，避免内存泄漏
+    // make_shared是一个模板函数，用于创建一个shared_ptr对象，避免手动调用new和delete
+    // 将add_queue和del_queue传入entry_controller_t构造函数，创建entry_controller对象，用于处理流表增删改
     std::shared_ptr<entry_controller_t> entry_controller = std::make_shared<entry_controller_t>(add_queue, del_queue);
     std::cout << "Entry controller initialized" << std::endl;
 
+    // 11. 初始化数据包处理器（pkt_processor），并将必要的全局对象传入
     std::cout << "Pkt processor initializing" << std::endl;
     pkt_processor_t::init_static_variable(argc, argv, &dpdk_config_args, rule_controller, add_queue, del_queue, flow_hash_map);
+    
+    // 12. 创建 pkt_processor 对象，用于处理数据包
     std::vector<std::shared_ptr<pkt_processor_t>> pkt_processors;
     for(int i = 0; i < dpdk_config_args.queue_size; i++) {
-        std::shared_ptr<pkt_processor_t> pkt_processor = std::make_shared<pkt_processor_t>(i);
+        std::shared_ptr<pkt_processor_t> pkt_processor = std::make_shared<pkt_processor_t>(i); // 创建 pkt_processor 对象，i 为队列编号
         pkt_processors.push_back(pkt_processor);
     }
     std::cout << "Pkt processor initialized" << std::endl;
 
+    // 13. 初始化两个 sockaddr_in，用于绑定本地端口和连接交换机
     sockaddr_in controller_addr, switch_addr;
     memset(&controller_addr, 0, sizeof(controller_addr));
-    controller_addr.sin_family = AF_INET;
-    controller_addr.sin_port = htons(local_switch_port);
-    controller_addr.sin_addr.s_addr = inet_addr(local_ip.c_str());
+    controller_addr.sin_family = AF_INET; // AF_INET 表示使用 IPv4 协议，sin_family 为地址族
+    controller_addr.sin_port = htons(local_switch_port); // htons 将主机字节序转换为网络字节序，sin_port 为端口号
+    controller_addr.sin_addr.s_addr = inet_addr(local_ip.c_str()); // inet_addr 将点分十进制的 IP 地址转换为网络字节序，sin_addr 为 IP 地址
     memset(&switch_addr, 0, sizeof(switch_addr));
     switch_addr.sin_family = AF_INET;
     switch_addr.sin_port = htons(switch_port);
     switch_addr.sin_addr.s_addr = inet_addr(switch_ip.c_str());
 
+    // 14. 创建 socket，用于连接交换机，并绑定本地端口
     int switch_fd = socket(AF_INET, SOCK_STREAM, 0);
     if(switch_fd == -1) {
         perror("socket");
         return -1;
     }
+    //bind的作用是将socket与本地地址绑定，这样socket就可以接收到发送到本地地址的数据包
     if(bind(switch_fd, (struct sockaddr *)&controller_addr, sizeof(controller_addr)) == -1) {
         perror("bind");
         return -1;
     }
     
+    // 15. 启动各个数据包处理器线程
     for(int i = 0; i < pkt_processor_core_ids.size(); ++i) {
         pkt_processors[i]->run(pkt_processor_core_ids[i]);
     }
-    
     std::cout << "Pkt processor started" << std::endl;
 
+    // 16. 连接交换机
     if(connect(switch_fd, (struct sockaddr *)&switch_addr, sizeof(switch_addr)) == -1) {
         perror("connect");
         return -1;
     }
     std::cout << "Connection established" << std::endl;
 
+    // 17. 将 switch_fd 添加到 epoll 监听事件中，用于监听交换机的事件
     epoll_event sock_ev;
     sock_ev.events = EPOLLIN;
     sock_ev.data.fd = switch_fd;
@@ -136,6 +163,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    // 18. 创建第一个 timer_fd (timer_fd)，周期为 100 微秒，用于将离线数据发送到交换机
     int timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     if(timer_fd == -1) {
         perror("timerfd_create");
@@ -143,8 +171,8 @@ int main(int argc, char *argv[]) {
     }
 
     itimerspec timer_spec;
-    timer_spec.it_interval.tv_nsec = 100000;
-    timer_spec.it_value.tv_nsec = 100000;
+    timer_spec.it_interval.tv_nsec = 100000; // 重复间隔
+    timer_spec.it_value.tv_nsec = 100000;    // 初始启动延迟
     timer_spec.it_interval.tv_sec = 0;
     timer_spec.it_value.tv_sec = 0;
     if(timerfd_settime(timer_fd, 0, &timer_spec, NULL) == -1) {
@@ -152,6 +180,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    // 19. 将 timer_fd 加入 epoll 监听
     epoll_event timer_ev;
     timer_ev.events = EPOLLIN;
     timer_ev.data.fd = timer_fd;
@@ -160,6 +189,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    // 20. 创建第二个定时器 (timer_fd_2)，每 1 秒触发一次，用于定期查询并打印 DPDK 网卡统计信息
     itimerspec timer_spec_2;
     timer_spec_2.it_interval.tv_nsec = 0;
     timer_spec_2.it_value.tv_nsec = 0;
@@ -183,12 +213,16 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    // 21. 进入主循环，通过 epoll_wait 同时监听交换机 FD 和两个定时器 FD
+    // 如果有数据到达 switch_fd，就根据协议进行规则更新，或虚拟服务器信息处理
+    // 如果 timer_fd 到期，就将离线队列中的数据（offloaded entries）发送给交换机
+    // 如果 timer_fd_2 到期，就查询 DPDK 端口统计数据并打印
     char send_buffer[ETH_FRAME_LEN], recv_buffer[ETH_FRAME_LEN];
     my_pair_t add_pairs[1024];
     my_key_t del_keys[1024];
     epoll_event events[2];
     while(true) {
-        int nfds = epoll_wait(epoll_fd, events, 2, -1);
+        int nfds = epoll_wait(epoll_fd, events, 2, -1); //nfds 表示就绪事件的数量，-1 表示阻塞直到有事件发生
         if(nfds == -1) {
             perror("epoll_wait");
             return -1;
