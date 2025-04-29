@@ -14,10 +14,12 @@ entry_controller_pro = subproject('entry_controller')
 entry_controller_dep = entry_controller_pro.get_variable('entry_controller_dep')
 pkt_processor_pro = subproject('pkt_processor')
 pkt_processor_dep = pkt_processor_pro.get_variable('pkt_processor_dep')
+rdma_pro = subproject('rdma')
+rdma_dep = rdma_pro.get_variable('rdma_dep')
 cc = meson.get_compiler('cpp')
 numa_dep = cc.find_library('numa', required: true)
 
 executable('L7LB_Server', 'main.cpp', 
             dependencies: [libcuckoo_dep, rule_controller_dep,  
                            entry_controller_dep, pkt_processor_dep,
-                           pthread_dep, dpdk_dep, json_dep, numa_dep])
+                           pthread_dep, dpdk_dep, json_dep, numa_dep, rdma_dep])

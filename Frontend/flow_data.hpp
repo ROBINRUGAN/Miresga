@@ -15,10 +15,10 @@ public:
 };
 
 class my_data_t {
-public:
-    uint8_t offload_flag;
-    uint8_t d_index;
-};
+    public:
+        uint8_t offload_flag;
+        uint8_t d_index;
+    };
 
 class my_hash_pair_t {
 public:
@@ -37,6 +37,14 @@ enum flow_state {
     BACKEND_SYN,
     OFFLOAD,
     COMPLETE,
+};
+
+struct flow_entry_serialized {
+    uint64_t key;
+    uint8_t crc;
+    flow_state state;
+    my_data_t entry_data;
+    uint32_t pkt_size;
 };
 
 class flow_data_t {

@@ -208,6 +208,9 @@ void run_controller() {
                     perror("epoll_ctl failed");
                     exit(1);
                 }
+
+
+                
                 send_buffer[0] = 0;
                 send_buffer[1] = rule_size;
                 send_buffer[2] = 0;
@@ -339,3 +342,4 @@ void run_controller() {
         }
     }
 }
+

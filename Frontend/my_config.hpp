@@ -18,7 +18,9 @@ enum operation_type_t {
     UPDATE_RULE,
     UPDATE_D_INDEX,
     UPDATE_V_INFO,
-    OFFLOAD_ENTRIES
+    OFFLOAD_ENTRIES,
+    RDMA_ONLINE,
+    RDMA_OFFLINE,
 };
 
 #endif

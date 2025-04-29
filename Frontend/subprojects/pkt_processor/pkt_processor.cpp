@@ -5,18 +5,21 @@ libcuckoo::cuckoohash_map<uint64_t, flow_data_t *> *pkt_processor_t::flow_hash_m
 rte_mempool *pkt_processor_t::mbuf_pool = nullptr;
 moodycamel::ConcurrentQueue<my_pair_t> *pkt_processor_t::add_queue = nullptr;
 moodycamel::ConcurrentQueue<my_key_t> *pkt_processor_t::del_queue = nullptr;
+rdma::Engine *pkt_processor_t::engine = nullptr;
 uint16_t pkt_processor_t::port_id = 0;
 rule_controller_t *pkt_processor_t::rule_controller = nullptr;
 dpdk_config_t *pkt_processor_t::dpdk_config = nullptr;
 rte_ether_addr pkt_processor_t::source_mac;
 
-pkt_processor_t::pkt_processor_t(int queue_id):add_token(*add_queue), del_token(*del_queue) {
+pkt_processor_t::pkt_processor_t(int queue_id) : add_token(*add_queue), del_token(*del_queue)
+{
     this->queue_id = queue_id;
     exit_flag = true;
     status = status_t::INTERNAL_ERROR;
 }
 
-uint8_t pkt_processor_t::calculate_crc8(uint32_t ip, uint16_t port) {
+uint8_t pkt_processor_t::calculate_crc8(uint32_t ip, uint16_t port)
+{
     uint8_t crc = 0;
     crc = crc8_table[crc ^ (ip & 0xff)];
     crc = crc8_table[crc ^ ((ip >> 8) & 0xff)];
@@ -28,56 +31,65 @@ uint8_t pkt_processor_t::calculate_crc8(uint32_t ip, uint16_t port) {
 }
 
 // This function should be customized.
-char *pkt_processor_t::parse_payload(char *payload, int payload_size, int &size) {
+char *pkt_processor_t::parse_payload(char *payload, int payload_size, int &size)
+{
     size = -1;
     int i = 0;
     // payload的格式为：GET /url HTTP/1.1
-    while(i < payload_size && payload[i] != '/') {
+    while (i < payload_size && payload[i] != '/')
+    {
         ++i;
     }
     ++i;
     char *res = payload + i;
     size = 0;
-    while(i < payload_size && payload[i] != ' ' && payload[i] != '\r') {
+    while (i < payload_size && payload[i] != ' ' && payload[i] != '\r')
+    {
         ++i;
         ++size;
     }
     return res;
 }
 
-
-status_t pkt_processor_t::process_pkts(rte_mbuf **recv_pkts, size_t pkt_num) {
-    #ifdef DEBUG 
+status_t pkt_processor_t::process_pkts(rte_mbuf **recv_pkts, size_t pkt_num)
+{
+#ifdef DEBUG
     std::cout << pkt_num << " packets received" << std::endl;
-    #endif
+#endif
     rte_mbuf *send_pkts[2 * pkt_num];
     size_t send_size = 0;
     // 1. 从mbuf_pool中分配2 * pkt_num个rte_mbuf结构体，分配成功则返回0，否则返回-1
     // 2. 分配成功后，将分配的rte_mbuf结构体的指针存储在send_pkts数组中
-    if(rte_pktmbuf_alloc_bulk(mbuf_pool, send_pkts, 2 * pkt_num) != 0) {
+    if (rte_pktmbuf_alloc_bulk(mbuf_pool, send_pkts, 2 * pkt_num) != 0)
+    {
         return status_t::INTERNAL_ERROR;
     }
     status_t status = status_t::OK;
     size_t send_pkt_num = 0;
     char url_copy[20];
-    for(int i = 0; i < pkt_num; ++i) {
+    for (int i = 0; i < pkt_num; ++i)
+    {
         uint16_t header_size = 0;
         bool payload_flag = false;
-        rte_ether_hdr* eth_hdr = rte_pktmbuf_mtod(recv_pkts[i], rte_ether_hdr*);
-        if(eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) {
+        rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(recv_pkts[i], rte_ether_hdr *);
+        if (eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))
+        {
             printf("[ERROR]: Receive a non-ipv4 packet.\n");
             continue;
         }
-        rte_ipv4_hdr* ip_hdr = (rte_ipv4_hdr*)(eth_hdr + 1);
-        if(ip_hdr->next_proto_id != IPPROTO_TCP) {
+        rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr *)(eth_hdr + 1);
+        if (ip_hdr->next_proto_id != IPPROTO_TCP)
+        {
             printf("[ERROR]: Receive a non-TCP packet.\n");
             continue;
         }
-        rte_tcp_hdr* tcp_hdr = (rte_tcp_hdr*)(ip_hdr + 1);
+        rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr *)(ip_hdr + 1);
         header_size = 20 + (tcp_hdr->data_off >> 4) * 4;
-        if(header_size < ntohs(ip_hdr->total_length)) {
+        if (header_size < ntohs(ip_hdr->total_length))
+        {
             payload_flag = true;
         }
+
         uint8_t src_crc = pkt_processor_t::calculate_crc8(ip_hdr->src_addr, tcp_hdr->src_port);
         uint8_t dst_crc = pkt_processor_t::calculate_crc8(ip_hdr->dst_addr, tcp_hdr->dst_port);
         uint64_t src_key = ((uint64_t)ip_hdr->src_addr << 32) + tcp_hdr->src_port;
@@ -85,253 +97,333 @@ status_t pkt_processor_t::process_pkts(rte_mbuf **recv_pkts, size_t pkt_num) {
         my_key_t src_my_key = {src_crc, htonl(ip_hdr->src_addr), htons(tcp_hdr->src_port)};
         my_key_t dst_my_key = {dst_crc, htonl(ip_hdr->dst_addr), htons(tcp_hdr->dst_port)};
         flow_data_t *flow_data = nullptr;
-        if(pkt_processor_t::flow_hash_map[src_crc].find(src_key, flow_data)) {
+
+        if (pkt_processor_t::flow_hash_map[src_crc].find(src_key, flow_data))
+        {
             // #ifdef DEBUG
             // std::cout << "Find a src flow data, state: " << flow_data->state << std::endl;
             // #endif
-            switch(flow_data->state) {
-                case(COMPLETE): 
-                case(OFFLOAD):
-                    if(tcp_hdr->tcp_flags & RTE_TCP_RST_FLAG) {
-                        // #ifdef DEBUG
-                        // std::cout << "Receive a rst packet.\n" << std::endl;
-                        // #endif
-                        status = forward_inbound_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size]);
-                        if(status != status_t::OK) {
-                            std::cout << "Failed to forward inbound pkt.\n" << std::endl;
-                            return status;
-                        }
-                        ++send_size;
-                        if(flow_data->state == OFFLOAD) {
-                            pkt_processor_t::del_queue->enqueue(del_token, src_my_key);
-                        }
-                        pkt_processor_t::flow_hash_map[src_crc].erase(src_key);
-                        if(flow_data->recv_pkt) {
-                            rte_free(flow_data->recv_pkt);
-                        }
-                        rte_free(flow_data);
-                        continue;
-                    }
-                    if(tcp_hdr->tcp_flags & RTE_TCP_FIN_FLAG) {
-                        // #ifdef DEBUG
-                        // std::cout << "Receive a fin packet.\n" << std::endl;
-                        // #endif
-                        status = reply_rst_pkt(recv_pkts[i], send_pkts[send_size]);
-                        if(status != status_t::OK) {
-                            std::cout << "Failed to reply rst pkt.\n" << std::endl;
-                            return status;
-                        }
-                        ++send_size;
-                        tcp_hdr->tcp_flags = RTE_TCP_RST_FLAG;
-                        status = forward_inbound_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size]);
-                        if(status != status_t::OK) {
-                            std::cout << "Failed to forward inbound pkt.\n" << std::endl;
-                            return status;
-                        }
-                        ++send_size;
-                        if(flow_data->state == OFFLOAD) {
-                            pkt_processor_t::del_queue->enqueue(del_token, src_my_key);
-                        }
-                        pkt_processor_t::flow_hash_map[src_crc].erase(src_key);
-                        if(flow_data->recv_pkt) {
-                            rte_free(flow_data->recv_pkt);
-                        }
-                        rte_free(flow_data);
-                        continue;
-                    }
-                    if(payload_flag) {
-                        char *payload = (char*)((void*)tcp_hdr + (tcp_hdr->data_off >> 4) * 4);
-                        int size = 0;
-                        char *url = parse_payload(payload, ntohs(ip_hdr->total_length) - header_size, size);
-                        if(size == -1) {
-                            #ifdef DEBUG
-                            std::cout << "[ERROR]: Receive a packet without url.\n";
-                            #endif
-                            continue;
-                        }
-                        rte_memcpy(url_copy, url, size);
-                        url_copy[size] = '\0';
-                        my_data_t *new_data;
-                        if((new_data = pkt_processor_t::rule_controller->lookup_balancing_rule(url_copy)) != nullptr) {
-                            if(new_data->d_index != flow_data->entry_data.d_index) {
-                                if(send_rst_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size]) != OK) {
-                                    std::cout << "Failed to send RST pkt.\n" << std::endl;
-                                    status = status_t::INTERNAL_ERROR;
-                                    return status;
-                                }
-                                ++send_size;
-                                if(flow_data->state == OFFLOAD) {
-                                   pkt_processor_t::del_queue->enqueue(del_token, src_my_key);
-                                }
-                                if(send_syn_pkt(new_data->d_index, recv_pkts[i], send_pkts[send_size]) != OK) {
-                                    std::cout << "Failed to send SYN pkt.\n" << std::endl;
-                                    status = status_t::INTERNAL_ERROR;
-                                    return status;
-                                }
-                                send_size++;
-                                flow_data->state = BACKEND_SYN;
-                                flow_data->entry_data = *new_data;
-                                if (flow_data->recv_pkt) {
-                                    rte_free(flow_data->recv_pkt);
-                                }
-                                flow_data->recv_pkt = (char*)rte_malloc("recv_pkt", recv_pkts[i]->data_len, 0);
-                                flow_data->pkt_size = recv_pkts[i]->data_len;
-                                memcpy(flow_data->recv_pkt, (void*)eth_hdr, recv_pkts[i]->data_len);
-                            }
-                            else {
-                                if((status = forward_inbound_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size])) != OK) {
-                                    std::cout << "Failed to forward inbound pkt.\n" << std::endl; 
-                                    return status;
-                                }
-                                send_size++;
-                                if(flow_data->state == COMPLETE && new_data->offload_flag == 1) {
-                                    flow_data->state = OFFLOAD;
-                                    my_pair_t new_pair;
-                                    new_pair.key = src_my_key;
-                                    new_pair.data = flow_data->entry_data;
-                                    pkt_processor_t::add_queue->enqueue(add_token, new_pair);
-                                }
-                                else if(flow_data->state == OFFLOAD && new_data->offload_flag == 0) {
-                                    flow_data->state = COMPLETE;
-                                    pkt_processor_t::del_queue->enqueue(del_token, src_my_key);
-                                }
-                            }
-                        }
-                        #ifdef DEBUG
-                        else {
-                            printf("[ERROR]: No balancing rule found.\n");
-                        }
-                        #endif
 
+            printf("Receive a src packet, src_ip: %u, src_port: %u, dst_ip: %u, dst_port: %u\n",
+                   ntohl(ip_hdr->src_addr), ntohs(tcp_hdr->src_port), ntohl(ip_hdr->dst_addr), ntohs(tcp_hdr->dst_port));
 
-                        continue;
-                    }
-                    if((status = forward_inbound_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size])) != OK) {
-                        std::cout << "Failed to forward inbound pkt.\n" << std::endl;
+            switch (flow_data->state)
+            {
+            case (COMPLETE):
+            case (OFFLOAD):
+                if (tcp_hdr->tcp_flags & RTE_TCP_RST_FLAG)
+                {
+                    status = forward_inbound_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size]);
+                    if (status != status_t::OK)
+                    {
+                        std::cout << "Failed to forward inbound pkt.\n"
+                                  << std::endl;
                         return status;
                     }
                     ++send_size;
+                    if (flow_data->state == OFFLOAD)
+                    {
+                        pkt_processor_t::del_queue->enqueue(del_token, src_my_key);
+                    }
+                    pkt_processor_t::flow_hash_map[src_crc].erase(src_key);
+                    /////////////////   update buffer!!!  /////////////////
+                    engine->serialize_crc_buffer(src_crc, flow_hash_map);
+                    engine->send_rdma_buffer(src_crc, flow_hash_map);
+                    //////////////////////////////////////////////////////
+                    if (flow_data->recv_pkt)
+                    {
+                        rte_free(flow_data->recv_pkt);
+                    }
+                    rte_free(flow_data);
                     continue;
-                case(BACKEND_SYN): {
-                    if((tcp_hdr->tcp_flags & RTE_TCP_FIN_FLAG) || (tcp_hdr->tcp_flags & RTE_TCP_RST_FLAG)) {
-                        if((status = reply_rst_pkt(recv_pkts[i], send_pkts[send_size])) != OK) {
-                            std::cout << "Failed to reply RST pkt.\n" << std::endl;
-                            return status;
-                        }
-                        ++send_size;
-                        if(flow_data->recv_pkt) {
-                            rte_free(flow_data->recv_pkt);
-                        }
-                        rte_free(flow_data);
+                }
+                if (tcp_hdr->tcp_flags & RTE_TCP_FIN_FLAG)
+                {
+                    // #ifdef DEBUG
+                    // std::cout << "Receive a fin packet.\n" << std::endl;
+                    // #endif
+                    status = reply_rst_pkt(recv_pkts[i], send_pkts[send_size]);
+                    if (status != status_t::OK)
+                    {
+                        std::cout << "Failed to reply rst pkt.\n"
+                                  << std::endl;
+                        return status;
+                    }
+                    ++send_size;
+                    tcp_hdr->tcp_flags = RTE_TCP_RST_FLAG;
+                    status = forward_inbound_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size]);
+                    if (status != status_t::OK)
+                    {
+                        std::cout << "Failed to forward inbound pkt.\n"
+                                  << std::endl;
+                        return status;
+                    }
+                    ++send_size;
+                    if (flow_data->state == OFFLOAD)
+                    {
+                        pkt_processor_t::del_queue->enqueue(del_token, src_my_key);
+                    }
+                    pkt_processor_t::flow_hash_map[src_crc].erase(src_key);
+                    /////////////////   update buffer!!!  /////////////////
+                    engine->serialize_crc_buffer(src_crc, flow_hash_map);
+                    engine->send_rdma_buffer(src_crc, flow_hash_map);
+                    //////////////////////////////////////////////////////
+                    if (flow_data->recv_pkt)
+                    {
+                        rte_free(flow_data->recv_pkt);
+                    }
+                    rte_free(flow_data);
+                    continue;
+                }
+                if (payload_flag)
+                {
+                    char *payload = (char *)((void *)tcp_hdr + (tcp_hdr->data_off >> 4) * 4);
+                    int size = 0;
+                    char *url = parse_payload(payload, ntohs(ip_hdr->total_length) - header_size, size);
+                    if (size == -1)
+                    {
+#ifdef DEBUG
+                        std::cout << "[ERROR]: Receive a packet without url.\n";
+#endif
                         continue;
                     }
-                    if(flow_data->recv_pkt) {
-                        rte_ether_hdr *recv_ether_hdr = (rte_ether_hdr *)flow_data->recv_pkt;
-                        rte_ipv4_hdr *recv_ip_hdr = (rte_ipv4_hdr *)(recv_ether_hdr + 1);
-                        rte_tcp_hdr *recv_tcp_hdr = (rte_tcp_hdr *)(recv_ip_hdr + 1);
-                        if(recv_tcp_hdr->sent_seq == tcp_hdr->sent_seq) {
-                            if((status = send_syn_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size])) != OK) {
-                                std::cout << "Failed to send SYN pkt.\n" << std::endl;
+                    rte_memcpy(url_copy, url, size);
+                    url_copy[size] = '\0';
+                    my_data_t *new_data;
+                    if ((new_data = pkt_processor_t::rule_controller->lookup_balancing_rule(url_copy)) != nullptr)
+                    {
+                        if (new_data->d_index != flow_data->entry_data.d_index)
+                        {
+                            if (send_rst_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size]) != OK)
+                            {
+                                std::cout << "Failed to send RST pkt.\n"
+                                          << std::endl;
+                                status = status_t::INTERNAL_ERROR;
                                 return status;
                             }
                             ++send_size;
+                            if (flow_data->state == OFFLOAD)
+                            {
+                                pkt_processor_t::del_queue->enqueue(del_token, src_my_key);
+                            }
+                            if (send_syn_pkt(new_data->d_index, recv_pkts[i], send_pkts[send_size]) != OK)
+                            {
+                                std::cout << "Failed to send SYN pkt.\n"
+                                          << std::endl;
+                                status = status_t::INTERNAL_ERROR;
+                                return status;
+                            }
+                            send_size++;
+                            flow_data->state = BACKEND_SYN;
+                            flow_data->entry_data = *new_data;
+                            if (flow_data->recv_pkt)
+                            {
+                                rte_free(flow_data->recv_pkt);
+                            }
+                            flow_data->recv_pkt = (char *)rte_malloc("recv_pkt", recv_pkts[i]->data_len, 0);
+                            flow_data->pkt_size = recv_pkts[i]->data_len;
+                            memcpy(flow_data->recv_pkt, (void *)eth_hdr, recv_pkts[i]->data_len);
+                        }
+                        else
+                        {
+                            if ((status = forward_inbound_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size])) != OK)
+                            {
+                                std::cout << "Failed to forward inbound pkt.\n"
+                                          << std::endl;
+                                return status;
+                            }
+                            send_size++;
+                            if (flow_data->state == COMPLETE && new_data->offload_flag == 1)
+                            {
+                                flow_data->state = OFFLOAD;
+                                my_pair_t new_pair;
+                                new_pair.key = src_my_key;
+                                new_pair.data = flow_data->entry_data;
+                                pkt_processor_t::add_queue->enqueue(add_token, new_pair);
+                            }
+                            else if (flow_data->state == OFFLOAD && new_data->offload_flag == 0)
+                            {
+                                flow_data->state = COMPLETE;
+                                pkt_processor_t::del_queue->enqueue(del_token, src_my_key);
+                            }
                         }
                     }
+#ifdef DEBUG
+                    else
+                    {
+                        printf("[ERROR]: No balancing rule found.\n");
+                    }
+#endif
+
                     continue;
                 }
+                if ((status = forward_inbound_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size])) != OK)
+                {
+                    std::cout << "Failed to forward inbound pkt.\n"
+                              << std::endl;
+                    return status;
+                }
+                ++send_size;
+                continue;
+            case (BACKEND_SYN):
+            {
+                if ((tcp_hdr->tcp_flags & RTE_TCP_FIN_FLAG) || (tcp_hdr->tcp_flags & RTE_TCP_RST_FLAG))
+                {
+                    if ((status = reply_rst_pkt(recv_pkts[i], send_pkts[send_size])) != OK)
+                    {
+                        std::cout << "Failed to reply RST pkt.\n"
+                                  << std::endl;
+                        return status;
+                    }
+                    ++send_size;
+                    if (flow_data->recv_pkt)
+                    {
+                        rte_free(flow_data->recv_pkt);
+                    }
+                    rte_free(flow_data);
+                    continue;
+                }
+                if (flow_data->recv_pkt)
+                {
+                    rte_ether_hdr *recv_ether_hdr = (rte_ether_hdr *)flow_data->recv_pkt;
+                    rte_ipv4_hdr *recv_ip_hdr = (rte_ipv4_hdr *)(recv_ether_hdr + 1);
+                    rte_tcp_hdr *recv_tcp_hdr = (rte_tcp_hdr *)(recv_ip_hdr + 1);
+                    if (recv_tcp_hdr->sent_seq == tcp_hdr->sent_seq)
+                    {
+                        if ((status = send_syn_pkt(flow_data->entry_data.d_index, recv_pkts[i], send_pkts[send_size])) != OK)
+                        {
+                            std::cout << "Failed to send SYN pkt.\n"
+                                      << std::endl;
+                            return status;
+                        }
+                        ++send_size;
+                    }
+                }
+                continue;
+            }
                 // default: {
                 //     std::cout << "[ERROR]: Receive a packet with invalid state: " << flow_data->state << std::endl;
                 //     continue;
                 // }
             }
         }
-        if(pkt_processor_t::flow_hash_map[dst_crc].find(dst_key, flow_data)) {
+        if (pkt_processor_t::flow_hash_map[dst_crc].find(dst_key, flow_data))
+        {
             // #ifdef DEBUG
             // std::cout << "Find a dst flow data" << std::endl;
             // #endif
-            switch(flow_data->state) {
-                case(BACKEND_SYN): {
-                    if(tcp_hdr->tcp_flags != (RTE_TCP_ACK_FLAG | RTE_TCP_SYN_FLAG)) {
-                        //std::cout << "[ERROR]: Receive a packet with invalid flags: " << std::hex << (int)tcp_hdr->tcp_flags << std::dec << std::endl;
-                        continue;
-                    }
-                    // #ifdef DEBUG
-                    // std::cout << "Receive a syn-ack packet.\n" << std::endl;
-                    // #endif
-                    my_pair_t new_pair;
-                    new_pair.key = dst_my_key;
-                    new_pair.data = flow_data->entry_data;
-                    if(flow_data->entry_data.offload_flag == 1) {
-                        flow_data->state = OFFLOAD;
-                        pkt_processor_t::add_queue->enqueue(add_token, new_pair);
-                    }
-                    else {
-                        flow_data->state = COMPLETE;
-                    }
-                    //std::cout << flow_data->state << std::endl;
-                    if((status = send_cached_pkt(flow_data->entry_data.d_index, flow_data->recv_pkt, send_pkts[send_size], flow_data->pkt_size)) != OK) {
-                        std::cout << "Failed to send cached pkt.\n" << std::endl;
-                        return status;
-                    }
-                    ++send_size;
+
+            printf("Receive a dst packet, src_ip: %u, src_port: %u, dst_ip: %u, dst_port: %u\n",
+                   ntohl(ip_hdr->src_addr), ntohs(tcp_hdr->src_port), ntohl(ip_hdr->dst_addr), ntohs(tcp_hdr->dst_port));
+            switch (flow_data->state)
+            {
+            case (BACKEND_SYN):
+            {
+                if (tcp_hdr->tcp_flags != (RTE_TCP_ACK_FLAG | RTE_TCP_SYN_FLAG))
+                {
+                    // std::cout << "[ERROR]: Receive a packet with invalid flags: " << std::hex << (int)tcp_hdr->tcp_flags << std::dec << std::endl;
                     continue;
                 }
-                case(COMPLETE):
-                case(OFFLOAD): {
-                    if(tcp_hdr->tcp_flags & RTE_TCP_RST_FLAG) {
-                        status = forward_outbound_pkt(recv_pkts[i], send_pkts[send_size]);
-                        if(status != status_t::OK) {
-                            std::cout << "Failed to forward outbound pkt.\n" << std::endl;
-                            return status;
-                        }
-                        ++send_size;
-                        if(flow_data->state == OFFLOAD) {
-                            pkt_processor_t::del_queue->enqueue(del_token, dst_my_key);
-                        }
-                        pkt_processor_t::flow_hash_map[dst_crc].erase(dst_key);
-                        if(flow_data->recv_pkt) {
-                            rte_free(flow_data->recv_pkt);
-                        }
-                        rte_free(flow_data);
-                        continue;
-                    }
-                    if(tcp_hdr->tcp_flags & RTE_TCP_FIN_FLAG) {
-                        status = reply_rst_pkt(recv_pkts[i], send_pkts[send_size]);
-                        if(status != status_t::OK) {
-                            std::cout << "Failed to reply RST pkt.\n" << std::endl;
-                            return status;
-                        }
-                        ++send_size;
-                        tcp_hdr->tcp_flags = RTE_TCP_RST_FLAG;
-                        status = forward_outbound_pkt(recv_pkts[i], send_pkts[send_size]);
-                        if(status != status_t::OK) {
-                            std::cout << "Failed to forward outbound pkt.\n" << std::endl;
-                            return status;
-                        }
-                        ++send_size;
-                        if(flow_data->state == OFFLOAD) {
-                            pkt_processor_t::del_queue->enqueue(del_token, dst_my_key);
-                        }
-                        pkt_processor_t::flow_hash_map[dst_crc].erase(dst_key);
-                        if(flow_data->recv_pkt) {
-                            rte_free(flow_data->recv_pkt);
-                        }
-                        rte_free(flow_data);
-                        continue;
-                    }
-                    #ifdef DEBUG
-                    if(flow_data->state == OFFLOAD) {
-                        std::cout << "[ERROR]: Receive an outbound packet in OFFLOAD state.\n";
-                    }
-                    #endif
+                // #ifdef DEBUG
+                // std::cout << "Receive a syn-ack packet.\n" << std::endl;
+                // #endif
+                my_pair_t new_pair;
+                new_pair.key = dst_my_key;
+                new_pair.data = flow_data->entry_data;
+                if (flow_data->entry_data.offload_flag == 1)
+                {
+                    flow_data->state = OFFLOAD;
+                    pkt_processor_t::add_queue->enqueue(add_token, new_pair);
+                }
+                else
+                {
+                    flow_data->state = COMPLETE;
+                }
+                // std::cout << flow_data->state << std::endl;
+                if ((status = send_cached_pkt(flow_data->entry_data.d_index, flow_data->recv_pkt, send_pkts[send_size], flow_data->pkt_size)) != OK)
+                {
+                    std::cout << "Failed to send cached pkt.\n"
+                              << std::endl;
+                    return status;
+                }
+                ++send_size;
+                continue;
+            }
+            case (COMPLETE):
+            case (OFFLOAD):
+            {
+                if (tcp_hdr->tcp_flags & RTE_TCP_RST_FLAG)
+                {
                     status = forward_outbound_pkt(recv_pkts[i], send_pkts[send_size]);
-                    if(status != status_t::OK) {
-                        printf("[ERROR]: Forward outbound packet failed.\n");
+                    if (status != status_t::OK)
+                    {
+                        std::cout << "Failed to forward outbound pkt.\n"
+                                  << std::endl;
                         return status;
                     }
                     ++send_size;
+                    if (flow_data->state == OFFLOAD)
+                    {
+                        pkt_processor_t::del_queue->enqueue(del_token, dst_my_key);
+                    }
+                    pkt_processor_t::flow_hash_map[dst_crc].erase(dst_key);
+                    /////////////////   update buffer!!!  /////////////////
+                    engine->serialize_crc_buffer(dst_crc, flow_hash_map);
+                    engine->send_rdma_buffer(dst_crc, flow_hash_map);
+                    //////////////////////////////////////////////////////
+                    if (flow_data->recv_pkt)
+                    {
+                        rte_free(flow_data->recv_pkt);
+                    }
+                    rte_free(flow_data);
                     continue;
                 }
+                if (tcp_hdr->tcp_flags & RTE_TCP_FIN_FLAG)
+                {
+                    status = reply_rst_pkt(recv_pkts[i], send_pkts[send_size]);
+                    if (status != status_t::OK)
+                    {
+                        std::cout << "Failed to reply RST pkt.\n"
+                                  << std::endl;
+                        return status;
+                    }
+                    ++send_size;
+                    tcp_hdr->tcp_flags = RTE_TCP_RST_FLAG;
+                    status = forward_outbound_pkt(recv_pkts[i], send_pkts[send_size]);
+                    if (status != status_t::OK)
+                    {
+                        std::cout << "Failed to forward outbound pkt.\n"
+                                  << std::endl;
+                        return status;
+                    }
+                    ++send_size;
+                    if (flow_data->state == OFFLOAD)
+                    {
+                        pkt_processor_t::del_queue->enqueue(del_token, dst_my_key);
+                    }
+                    pkt_processor_t::flow_hash_map[dst_crc].erase(dst_key);
+                    if (flow_data->recv_pkt)
+                    {
+                        rte_free(flow_data->recv_pkt);
+                    }
+                    rte_free(flow_data);
+                    continue;
+                }
+#ifdef DEBUG
+                if (flow_data->state == OFFLOAD)
+                {
+                    std::cout << "[ERROR]: Receive an outbound packet in OFFLOAD state.\n";
+                }
+#endif
+                status = forward_outbound_pkt(recv_pkts[i], send_pkts[send_size]);
+                if (status != status_t::OK)
+                {
+                    printf("[ERROR]: Forward outbound packet failed.\n");
+                    return status;
+                }
+                ++send_size;
+                continue;
+            }
                 // default: {
                 //     #ifdef DEBUG
                 //     std::cout << "[ERROR]: Receive a packet with invalid state " << flow_data->state << std::endl;
@@ -345,30 +437,34 @@ status_t pkt_processor_t::process_pkts(rte_mbuf **recv_pkts, size_t pkt_num) {
         // #endif
         my_pair_t new_pair;
         new_pair.key = src_my_key;
-        char *payload = (char*)((void*)tcp_hdr + (tcp_hdr->data_off >> 4) * 4);
-        if(!payload_flag) {
-            #ifdef DEBUG
+        char *payload = (char *)((void *)tcp_hdr + (tcp_hdr->data_off >> 4) * 4);
+        if (!payload_flag)
+        {
+#ifdef DEBUG
             printf("[ERROR]: Receive a packet without payload.\n");
-            #endif
+#endif
             continue;
         }
         int size = 0;
         char *url = parse_payload(payload, ntohs(ip_hdr->total_length) - header_size, size);
-        if(size == -1) {
-            #ifdef DEBUG
+        if (size == -1)
+        {
+#ifdef DEBUG
             printf("[ERROR]: Receive a packet without url.\n");
-            #endif
+#endif
             continue;
         }
-        
+
         rte_memcpy(url_copy, url, size);
         url_copy[size] = '\0';
         // #ifdef DEBUG
         // printf("[INFO]: Receive a packet with url: %s\n", url_copy);
         // #endif
         my_data_t *new_data = nullptr;
-        if((new_data = pkt_processor_t::rule_controller->lookup_balancing_rule(url_copy)) != nullptr) {
-            if(send_syn_pkt(new_data->d_index, recv_pkts[i], send_pkts[send_size]) != OK) {
+        if ((new_data = pkt_processor_t::rule_controller->lookup_balancing_rule(url_copy)) != nullptr)
+        {
+            if (send_syn_pkt(new_data->d_index, recv_pkts[i], send_pkts[send_size]) != OK)
+            {
                 printf("[ERROR]: Send SYN packet failed.\n");
                 status = status_t::INTERNAL_ERROR;
                 return status;
@@ -376,21 +472,28 @@ status_t pkt_processor_t::process_pkts(rte_mbuf **recv_pkts, size_t pkt_num) {
             flow_data = (flow_data_t *)rte_malloc_socket("flow_data", sizeof(flow_data_t), 0, 3);
             flow_data->state = BACKEND_SYN;
             flow_data->entry_data = *new_data;
-            flow_data->recv_pkt = (char*)rte_malloc_socket("recv_pkt", recv_pkts[i]->data_len, 0, 3);
-            memcpy(flow_data->recv_pkt, (void*)eth_hdr, recv_pkts[i]->data_len);
+            flow_data->recv_pkt = (char *)rte_malloc_socket("recv_pkt", recv_pkts[i]->data_len, 0, 3);
+            memcpy(flow_data->recv_pkt, (void *)eth_hdr, recv_pkts[i]->data_len);
             flow_data->pkt_size = recv_pkts[i]->data_len;
             pkt_processor_t::flow_hash_map[src_crc].insert(src_key, flow_data);
+            /////////////////   update buffer!!!  /////////////////
+            engine->serialize_crc_buffer(src_crc, flow_hash_map);
+            engine->send_rdma_buffer(src_crc, flow_hash_map);
+            //////////////////////////////////////////////////////
+            printf("Receive a new src packet, src_ip: %u, src_port: %u, dst_ip: %u, dst_port: %u, crc: %u\n",
+                   ntohl(ip_hdr->src_addr), ntohs(tcp_hdr->src_port), ntohl(ip_hdr->dst_addr), ntohs(tcp_hdr->dst_port), src_crc);
             ++send_size;
-            
         }
-        #ifdef DEBUG
-        else {
+#ifdef DEBUG
+        else
+        {
             printf("[ERROR]: No balancing rule found.\n");
         }
-        #endif
+#endif
         continue;
     }
-    if(rte_eth_tx_burst(pkt_processor_t::port_id, queue_id, send_pkts, send_size) != send_size) {
+    if (rte_eth_tx_burst(pkt_processor_t::port_id, queue_id, send_pkts, send_size) != send_size)
+    {
         printf("[ERROR]: Transmit packets failed.\n");
         status = status_t::INTERNAL_ERROR;
     }
@@ -401,15 +504,17 @@ status_t pkt_processor_t::process_pkts(rte_mbuf **recv_pkts, size_t pkt_num) {
     return status;
 }
 
-status_t pkt_processor_t::forward_inbound_pkt(uint8_t d_index, rte_mbuf* recv_buf, rte_mbuf *send_buf) {
-    void *packet = rte_pktmbuf_mtod(recv_buf, void*);
-    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr*);
+status_t pkt_processor_t::forward_inbound_pkt(uint8_t d_index, rte_mbuf *recv_buf, rte_mbuf *send_buf)
+{
+    void *packet = rte_pktmbuf_mtod(recv_buf, void *);
+    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr *);
     memcpy(eth_hdr, packet, recv_buf->data_len);
-    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr*)(eth_hdr + 1);
-    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr*)(ip_hdr + 1);
-    
+    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr *)(eth_hdr + 1);
+    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr *)(ip_hdr + 1);
+
     server_info_t *server_info = pkt_processor_t::rule_controller->lookup_backend_server_info(d_index);
-    if(server_info == nullptr) {
+    if (server_info == nullptr)
+    {
         printf("[ERROR]: Cannot find the backend server.\n");
         return status_t::INTERNAL_ERROR;
     }
@@ -428,16 +533,18 @@ status_t pkt_processor_t::forward_inbound_pkt(uint8_t d_index, rte_mbuf* recv_bu
     return OK;
 }
 
-status_t pkt_processor_t::forward_outbound_pkt(rte_mbuf *recv_buf, rte_mbuf *send_buf) {
-    void *packet = rte_pktmbuf_mtod(recv_buf, void*);
-    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr*);
+status_t pkt_processor_t::forward_outbound_pkt(rte_mbuf *recv_buf, rte_mbuf *send_buf)
+{
+    void *packet = rte_pktmbuf_mtod(recv_buf, void *);
+    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr *);
     memcpy(eth_hdr, packet, recv_buf->data_len);
-    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr*)(eth_hdr + 1);
-    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr*)(ip_hdr + 1);
-    
+    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr *)(eth_hdr + 1);
+    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr *)(ip_hdr + 1);
+
     server_info_t *server_info = pkt_processor_t::rule_controller->get_virtual_server_info();
-    if(server_info == nullptr) {
-        //printf("[ERROR]: Cannot find the backend server.\n");
+    if (server_info == nullptr)
+    {
+        // printf("[ERROR]: Cannot find the backend server.\n");
         return status_t::INTERNAL_ERROR;
     }
     rte_ether_addr_copy(&pkt_processor_t::source_mac, &eth_hdr->src_addr);
@@ -455,16 +562,17 @@ status_t pkt_processor_t::forward_outbound_pkt(rte_mbuf *recv_buf, rte_mbuf *sen
     return OK;
 }
 
-status_t pkt_processor_t::reply_rst_pkt(rte_mbuf *recv_buf, rte_mbuf *send_buf) {
-    void *packet = rte_pktmbuf_mtod(recv_buf, void*);
-    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr*);
+status_t pkt_processor_t::reply_rst_pkt(rte_mbuf *recv_buf, rte_mbuf *send_buf)
+{
+    void *packet = rte_pktmbuf_mtod(recv_buf, void *);
+    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr *);
     memcpy(eth_hdr, packet, 40 + sizeof(rte_ether_hdr));
-    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr*)(eth_hdr + 1);
-    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr*)(ip_hdr + 1);
-    //rte_ether_addr tmp;
-    //rte_ether_addr_copy(&eth_hdr->d_addr, &tmp);
+    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr *)(eth_hdr + 1);
+    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr *)(ip_hdr + 1);
+    // rte_ether_addr tmp;
+    // rte_ether_addr_copy(&eth_hdr->d_addr, &tmp);
     rte_ether_addr_copy(&eth_hdr->src_addr, &eth_hdr->dst_addr);
-    //rte_ether_addr_copy(&tmp, &eth_hdr->s_addr);
+    // rte_ether_addr_copy(&tmp, &eth_hdr->s_addr);
     rte_ether_addr_copy(&pkt_processor_t::source_mac, &eth_hdr->src_addr);
     uint32_t tmp_ip = ip_hdr->src_addr;
     ip_hdr->src_addr = ip_hdr->dst_addr;
@@ -491,18 +599,19 @@ status_t pkt_processor_t::reply_rst_pkt(rte_mbuf *recv_buf, rte_mbuf *send_buf) 
     return OK;
 }
 
-status_t pkt_processor_t::send_rst_pkt(uint8_t d_index, rte_mbuf *recv_buf, rte_mbuf *send_buf) {
-    void *packet = rte_pktmbuf_mtod(recv_buf, void*);
-    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr*);
+status_t pkt_processor_t::send_rst_pkt(uint8_t d_index, rte_mbuf *recv_buf, rte_mbuf *send_buf)
+{
+    void *packet = rte_pktmbuf_mtod(recv_buf, void *);
+    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr *);
     memcpy(eth_hdr, packet, 40 + sizeof(rte_ether_hdr));
-    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr*)(eth_hdr + 1);
-    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr*)(ip_hdr + 1);
+    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr *)(eth_hdr + 1);
+    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr *)(ip_hdr + 1);
     server_info_t *server_info = pkt_processor_t::rule_controller->lookup_backend_server_info(d_index);
     rte_ether_addr_copy(&server_info->mac, &eth_hdr->dst_addr);
     rte_ether_addr_copy(&pkt_processor_t::source_mac, &eth_hdr->src_addr);
     ip_hdr->dst_addr = server_info->ip;
     ip_hdr->version_ihl = 5 + (ip_hdr->version_ihl & 0xf0);
-    ip_hdr->total_length = htons(40);  
+    ip_hdr->total_length = htons(40);
     ip_hdr->hdr_checksum = 0;
     tcp_hdr->dst_port = server_info->port;
     tcp_hdr->tcp_flags = RTE_TCP_RST_FLAG;
@@ -514,19 +623,20 @@ status_t pkt_processor_t::send_rst_pkt(uint8_t d_index, rte_mbuf *recv_buf, rte_
     send_buf->l4_len = 20;
     send_buf->data_len = 40 + sizeof(rte_ether_hdr);
     send_buf->pkt_len = send_buf->data_len;
-    return OK; 
+    return OK;
 }
 
-status_t pkt_processor_t::send_cached_pkt(uint8_t d_index, char *cached_pkt, rte_mbuf *send_buf, size_t size) {
-    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr*);
+status_t pkt_processor_t::send_cached_pkt(uint8_t d_index, char *cached_pkt, rte_mbuf *send_buf, size_t size)
+{
+    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr *);
     memcpy(eth_hdr, cached_pkt, size);
     server_info_t *server_info = pkt_processor_t::rule_controller->lookup_backend_server_info(d_index);
     rte_ether_addr_copy(&server_info->mac, &eth_hdr->dst_addr);
     rte_ether_addr_copy(&pkt_processor_t::source_mac, &eth_hdr->src_addr);
-    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr*)(eth_hdr + 1);
+    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr *)(eth_hdr + 1);
     ip_hdr->dst_addr = htonl(server_info->ip);
     ip_hdr->hdr_checksum = 0;
-    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr*)(ip_hdr + 1);
+    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr *)(ip_hdr + 1);
     tcp_hdr->dst_port = htons(server_info->port);
     tcp_hdr->cksum = 0;
     send_buf->ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM | RTE_MBUF_F_TX_TCP_CKSUM;
@@ -538,19 +648,25 @@ status_t pkt_processor_t::send_cached_pkt(uint8_t d_index, char *cached_pkt, rte
     return OK;
 }
 
-status_t pkt_processor_t::send_syn_pkt(uint8_t d_index, rte_mbuf *recv_buf, rte_mbuf *send_buf) {
-    void *packet = rte_pktmbuf_mtod(recv_buf, void*);
-    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr*);
+status_t pkt_processor_t::send_syn_pkt(uint8_t d_index, rte_mbuf *recv_buf, rte_mbuf *send_buf)
+{
+    void *packet = rte_pktmbuf_mtod(recv_buf, void *);
+    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(send_buf, rte_ether_hdr *);
     memcpy(eth_hdr, packet, 52 + sizeof(rte_ether_hdr));
     server_info_t *server_info = pkt_processor_t::rule_controller->lookup_backend_server_info(d_index);
+    if (server_info == nullptr)
+    {
+        printf("[ERROR]: Cannot find the backend server %d.\n", d_index);
+        return status_t::INTERNAL_ERROR;
+    }
     rte_ether_addr_copy(&pkt_processor_t::source_mac, &eth_hdr->src_addr);
     rte_ether_addr_copy(&server_info->mac, &eth_hdr->dst_addr);
-    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr*)(eth_hdr + 1);
+    rte_ipv4_hdr *ip_hdr = (rte_ipv4_hdr *)(eth_hdr + 1);
     ip_hdr->dst_addr = htonl(server_info->ip);
     ip_hdr->version_ihl = 5 + (ip_hdr->version_ihl & 0xf0);
     ip_hdr->total_length = htons(52);
     ip_hdr->hdr_checksum = 0;
-    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr*)(ip_hdr + 1);
+    rte_tcp_hdr *tcp_hdr = (rte_tcp_hdr *)(ip_hdr + 1);
     tcp_hdr->dst_port = htons(server_info->port);
     tcp_hdr->tcp_flags = RTE_TCP_SYN_FLAG;
     tcp_hdr->data_off = 8 << 4;
@@ -568,17 +684,21 @@ status_t pkt_processor_t::send_syn_pkt(uint8_t d_index, rte_mbuf *recv_buf, rte_
     return OK;
 }
 
-int pkt_processor_t::worker_fun(void *args) {
+int pkt_processor_t::worker_fun(void *args)
+{
     std::cout << "Worker thread is running." << std::endl;
     int queue_id = this->queue_id;
     rte_mbuf *recv_pkts[pkt_processor_t::dpdk_config->burst_size];
-    while(!exit_flag) {
+    while (!exit_flag)
+    {
         int pkt_num = rte_eth_rx_burst(pkt_processor_t::port_id, queue_id, recv_pkts, pkt_processor_t::dpdk_config->burst_size);
-        if(pkt_num == 0) {
+        if (pkt_num == 0)
+        {
             continue;
         }
         status = process_pkts(recv_pkts, pkt_num);
-        if(status != OK) {
+        if (status != OK)
+        {
             printf("[ERROR]: Process packets failed.\n");
         }
         rte_pktmbuf_free_bulk(recv_pkts, pkt_num);
@@ -587,19 +707,27 @@ int pkt_processor_t::worker_fun(void *args) {
 }
 
 status_t pkt_processor_t::init_static_variable(int argc, char **argv, dpdk_config_t *dpdk_config,
-                                               rule_controller_t *rule_controller, 
+                                               rule_controller_t *rule_controller,
                                                moodycamel::ConcurrentQueue<my_pair_t> *add_queue,
                                                moodycamel::ConcurrentQueue<my_key_t> *del_queue,
-                                               libcuckoo::cuckoohash_map<uint64_t, flow_data_t *> *flow_hash_map) {
+                                               libcuckoo::cuckoohash_map<uint64_t, flow_data_t *> *flow_hash_map,
+                                               rdma::Engine *engine)
+{
     pkt_processor_t::add_queue = add_queue;
     pkt_processor_t::del_queue = del_queue;
     pkt_processor_t::flow_hash_map = flow_hash_map;
-    for (int i = 0; i < 256; i++) {
+    pkt_processor_t::engine = engine;
+    for (int i = 0; i < 256; i++)
+    {
         uint8_t crc = i;
-        for (int j = 0; j < 8; j++) {
-            if (crc & 0x80) {
+        for (int j = 0; j < 8; j++)
+        {
+            if (crc & 0x80)
+            {
                 crc = (crc << 1) ^ 0x07; // 使用多项式0x07
-            } else {
+            }
+            else
+            {
                 crc = crc << 1;
             }
         }
@@ -608,22 +736,26 @@ status_t pkt_processor_t::init_static_variable(int argc, char **argv, dpdk_confi
     pkt_processor_t::rule_controller = rule_controller;
     pkt_processor_t::dpdk_config = dpdk_config;
     int ret = rte_eal_init(argc, argv);
-    if(ret < 0) {
+    if (ret < 0)
+    {
         perror("rte_eal_init");
         return INTERNAL_ERROR;
     }
     pkt_processor_t::mbuf_pool = rte_pktmbuf_pool_create("mbuf_pool", dpdk_config->num_mbufs, dpdk_config->mbuf_cache_size, 0, dpdk_config->mbuf_data_room_size, rte_socket_id());
-    if(pkt_processor_t::mbuf_pool == nullptr) {
+    if (pkt_processor_t::mbuf_pool == nullptr)
+    {
         perror("rte_pktmbuf_pool_create");
         return INTERNAL_ERROR;
     }
     ret = rte_eth_dev_get_port_by_name(dpdk_config->pci_addr, &pkt_processor_t::port_id);
-    if(ret < 0) {
+    if (ret < 0)
+    {
         perror("rte_eth_dev_get_port_by_name");
         return INTERNAL_ERROR;
     }
     ret = rte_eth_macaddr_get(pkt_processor_t::port_id, &pkt_processor_t::source_mac);
-    if(ret < 0) {
+    if (ret < 0)
+    {
         perror("rte_eth_macaddr_get");
         return INTERNAL_ERROR;
     }
@@ -632,45 +764,50 @@ status_t pkt_processor_t::init_static_variable(int argc, char **argv, dpdk_confi
     port_conf.rxmode.offloads = RTE_ETH_RX_OFFLOAD_CHECKSUM;
     port_conf.txmode.offloads = RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
     port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
-    port_conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_IP| RTE_ETH_RSS_TCP;
+    port_conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_TCP;
     ret = rte_eth_dev_configure(pkt_processor_t::port_id, dpdk_config->queue_size, dpdk_config->queue_size, &port_conf);
-    if(ret < 0) {
+    if (ret < 0)
+    {
         perror("rte_eth_dev_configure");
         return INTERNAL_ERROR;
     }
     rte_eth_dev_info dev_info;
     ret = rte_eth_dev_info_get(pkt_processor_t::port_id, &dev_info);
-    if(ret < 0) {
+    if (ret < 0)
+    {
         perror("rte_eth_dev_info_get");
         return INTERNAL_ERROR;
     }
     rte_eth_rxconf rxconf = dev_info.default_rxconf;
     rte_eth_txconf txconf = dev_info.default_txconf;
-    
+
     txconf.offloads |= RTE_ETH_TX_OFFLOAD_IPV4_CKSUM;
     txconf.offloads |= RTE_ETH_TX_OFFLOAD_TCP_CKSUM;
-    for(int i = 0; i < dpdk_config->queue_size; ++i) {
+    for (int i = 0; i < dpdk_config->queue_size; ++i)
+    {
         ret = rte_eth_rx_queue_setup(pkt_processor_t::port_id, i, 2048, rte_socket_id(), &rxconf, mbuf_pool);
-        if(ret < 0)
+        if (ret < 0)
         {
             perror("rte_eth_rx_queue_setup");
             return INTERNAL_ERROR;
         }
 
         ret = rte_eth_tx_queue_setup(pkt_processor_t::port_id, i, 2048, rte_socket_id(), &txconf);
-        if(ret < 0) 
+        if (ret < 0)
         {
             perror("rte_eth_tx_queue_setup");
             return INTERNAL_ERROR;
         }
     }
     ret = rte_eth_promiscuous_enable(pkt_processor_t::port_id);
-    if(ret < 0) {
+    if (ret < 0)
+    {
         perror("rte_eth_promiscuous_enable");
         return INTERNAL_ERROR;
     }
     ret = rte_eth_dev_start(pkt_processor_t::port_id);
-    if(ret < 0) {
+    if (ret < 0)
+    {
         perror("rte_eth_dev_start");
         return INTERNAL_ERROR;
     }
@@ -678,32 +815,56 @@ status_t pkt_processor_t::init_static_variable(int argc, char **argv, dpdk_confi
     return OK;
 }
 
-int pkt_processor_t::worker_run_warpper(void *args) {
-    pkt_processor_t *pkt_processor = (pkt_processor_t*)args;
+int pkt_processor_t::worker_run_warpper(void *args)
+{
+    // std::cout << "worker run warpper start" << std::endl;
+    pkt_processor_t *pkt_processor = (pkt_processor_t *)args;
     pkt_processor->worker_fun(nullptr);
+    // std::cout << "worker run done" << std::endl;
     return 0;
 }
 
-void pkt_processor_t::run(int core_id) {
+void pkt_processor_t::run(int core_id)
+{
     exit_flag = false;
     // 创建线程
-    rte_eal_remote_launch(&pkt_processor_t::worker_run_warpper, this, core_id);
+    std::cout << "Trying to launch on core " << core_id << std::endl;
+    if (!rte_lcore_is_enabled(core_id))
+    {
+        std::cerr << "Core " << core_id << " is not enabled by DPDK!" << std::endl;
+    }
+    else
+    {
+        std::cout << "Launching on core " << core_id << std::endl;
+    }
+    if (core_id == rte_get_main_lcore())
+    {
+        std::cerr << "Error: 不能用主 core 调度 remote_launch。" << std::endl;
+    }
+
+    int ret = rte_eal_remote_launch(&pkt_processor_t::worker_run_warpper, this, core_id);
 }
 
-void pkt_processor_t::stop() {
+void pkt_processor_t::stop()
+{
     exit_flag = true;
     uint32_t core_id;
-    RTE_LCORE_FOREACH_WORKER(core_id) {
+    RTE_LCORE_FOREACH_WORKER(core_id)
+    {
         rte_eal_wait_lcore(core_id);
     }
 }
 
-void pkt_processor_t::destroy_static_variable() {
+void pkt_processor_t::destroy_static_variable()
+{
     // 清理哈希表中的条目
-    for(int i = 0; i < 256; ++i) {
-        for(auto it = pkt_processor_t::flow_hash_map[i].lock_table().begin(); it != pkt_processor_t::flow_hash_map[i].lock_table().end(); it++) {
+    for (int i = 0; i < 256; ++i)
+    {
+        for (auto it = pkt_processor_t::flow_hash_map[i].lock_table().begin(); it != pkt_processor_t::flow_hash_map[i].lock_table().end(); it++)
+        {
             flow_data_t *flow_data = it->second;
-            if(flow_data->recv_pkt != nullptr) {
+            if (flow_data->recv_pkt != nullptr)
+            {
                 rte_free(flow_data->recv_pkt);
             }
             rte_free(flow_data);
@@ -720,11 +881,13 @@ void pkt_processor_t::destroy_static_variable() {
     uint16_t nb_rx_queues = dev_info.nb_rx_queues;
     uint16_t nb_tx_queues = dev_info.nb_tx_queues;
 
-    for (uint16_t q = 0; q < nb_rx_queues; q++) {
+    for (uint16_t q = 0; q < nb_rx_queues; q++)
+    {
         rte_eth_dev_rx_queue_stop(pkt_processor_t::port_id, q);
     }
 
-    for (uint16_t q = 0; q < nb_tx_queues; q++) {
+    for (uint16_t q = 0; q < nb_tx_queues; q++)
+    {
         rte_eth_dev_tx_queue_stop(pkt_processor_t::port_id, q);
     }
 

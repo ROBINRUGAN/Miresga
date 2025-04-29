@@ -8,23 +8,21 @@
 #include "entry_controller.hpp"
 #include "my_config.hpp"
 #include "concurrentqueue/concurrentqueue.h"
-
+#include "rdma/include/engine.hpp"
 using json = nlohmann::json; //xx JSON 解析库的别名
-
 int main(int argc, char *argv[]) {
 
-    // 1. 读取 config.json 配置文件
     std::ifstream total_config(CONFIG_PATH);
     json config;
-    total_config >> config; // 将 JSON 文件反序列化到 config 对象
+    total_config >> config; 
 
-    // 2. 从 config 对象中读取配置信息
     std::string local_ip = config["local_ip"];
     uint32_t local_switch_port = config["local_switch_port"];
     std::string switch_ip = config["switch_ip"];
     uint32_t switch_port = config["switch_port"];
+    std::string rdma_dev = config["rdma_dev"];
+    std::string my_name = config["name"];
 
-    // 3. 根据配置文件中的 pkt_processor_core_ids 分配处理器核心
     std::vector<int> pkt_processor_core_ids;
 
     // 4. 检查并设置 NUMA 节点（若系统支持 NUMA）
@@ -81,34 +79,28 @@ int main(int argc, char *argv[]) {
     std::cout << dpdk_config_args.queue_size << std::endl;
     dpdk_config.close();
 
-    // 7. 创建 epoll，用于后续监听 socket、timer 等事件
     int epoll_fd = epoll_create1(0); // 创建 epoll 文件描述符，填写0表示使用默认参数，返回值为 epoll 文件描述符
     if(epoll_fd == -1) {
         perror("epoll_create1");
         return -1;
     }
 
-    // 8. 创建一个流量记录的哈希表（libcuckoo 哈希表，256 个分片），用于记录流量信息
     libcuckoo::cuckoohash_map<uint64_t, flow_data_t *> flow_hash_map[256];
+    rdma::Engine* engine = new rdma::Engine(rdma_dev.c_str()); // 创建 RDMA 引擎对象，传入 RDMA 设备名称
+
     
-    // 9. 初始化 rule_controller（处理规则增删改）
     std::cout << "Rule controller initializing" << std::endl;
     rule_controller_t *rule_controller = new rule_controller_t;
     std::cout << "Rule controller initialized" << std::endl;
 
-    // 10. 初始化 entry_controller（处理流表增删改）
     std::cout << "Entry controller initializing" << std::endl;
     moodycamel::ConcurrentQueue<my_pair_t> *add_queue = new moodycamel::ConcurrentQueue<my_pair_t>;
     moodycamel::ConcurrentQueue<my_key_t> *del_queue = new moodycamel::ConcurrentQueue<my_key_t>;
-    // shared_ptr是一个智能指针，用于管理指针的生命周期，避免内存泄漏
-    // make_shared是一个模板函数，用于创建一个shared_ptr对象，避免手动调用new和delete
-    // 将add_queue和del_queue传入entry_controller_t构造函数，创建entry_controller对象，用于处理流表增删改
     std::shared_ptr<entry_controller_t> entry_controller = std::make_shared<entry_controller_t>(add_queue, del_queue);
     std::cout << "Entry controller initialized" << std::endl;
 
-    // 11. 初始化数据包处理器（pkt_processor），并将必要的全局对象传入
     std::cout << "Pkt processor initializing" << std::endl;
-    pkt_processor_t::init_static_variable(argc, argv, &dpdk_config_args, rule_controller, add_queue, del_queue, flow_hash_map);
+    pkt_processor_t::init_static_variable(argc, argv, &dpdk_config_args, rule_controller, add_queue, del_queue, flow_hash_map, engine);
     
     // 12. 创建 pkt_processor 对象，用于处理数据包
     std::vector<std::shared_ptr<pkt_processor_t>> pkt_processors;
@@ -128,6 +120,8 @@ int main(int argc, char *argv[]) {
     switch_addr.sin_family = AF_INET;
     switch_addr.sin_port = htons(switch_port);
     switch_addr.sin_addr.s_addr = inet_addr(switch_ip.c_str());
+    std::cout << "socketin成功了" << std::endl;
+
 
     // 14. 创建 socket，用于连接交换机，并绑定本地端口
     int switch_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -135,24 +129,35 @@ int main(int argc, char *argv[]) {
         perror("socket");
         return -1;
     }
+    std::cout << "socket成功了" << std::endl;
+
+
     //bind的作用是将socket与本地地址绑定，这样socket就可以接收到发送到本地地址的数据包
     if(bind(switch_fd, (struct sockaddr *)&controller_addr, sizeof(controller_addr)) == -1) {
         perror("bind");
         return -1;
     }
-    
+    std::cout << "bind成功了" << std::endl;
+
     // 15. 启动各个数据包处理器线程
     for(int i = 0; i < pkt_processor_core_ids.size(); ++i) {
+
+        std::cout << "Pkt processor " << i << " starting" << std::endl;
         pkt_processors[i]->run(pkt_processor_core_ids[i]);
+        std::cout << "Pkt processor " << i << " started" << std::endl;
     }
     std::cout << "Pkt processor started" << std::endl;
 
     // 16. 连接交换机
     if(connect(switch_fd, (struct sockaddr *)&switch_addr, sizeof(switch_addr)) == -1) {
+        std::cout<<switch_fd<<std::endl;
+        std::cout<<"连接有问题"<<std::endl;
         perror("connect");
         return -1;
     }
+
     std::cout << "Connection established" << std::endl;
+
 
     // 17. 将 switch_fd 添加到 epoll 监听事件中，用于监听交换机的事件
     epoll_event sock_ev;
@@ -213,11 +218,14 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
+    engine->connect_to_tofino(switch_fd);
+
+
     // 21. 进入主循环，通过 epoll_wait 同时监听交换机 FD 和两个定时器 FD
     // 如果有数据到达 switch_fd，就根据协议进行规则更新，或虚拟服务器信息处理
     // 如果 timer_fd 到期，就将离线队列中的数据（offloaded entries）发送给交换机
     // 如果 timer_fd_2 到期，就查询 DPDK 端口统计数据并打印
-    char send_buffer[ETH_FRAME_LEN], recv_buffer[ETH_FRAME_LEN];
+    char send_buffer[4096], recv_buffer[4096];
     my_pair_t add_pairs[1024];
     my_key_t del_keys[1024];
     epoll_event events[2];
@@ -230,7 +238,7 @@ int main(int argc, char *argv[]) {
         if(nfds > 0) {
             for(int i = 0; i < nfds; i++) {
                 if(events[i].data.fd == switch_fd) {
-                    ssize_t recv_size = recv(switch_fd, recv_buffer, ETH_FRAME_LEN, 0);
+                    ssize_t recv_size = recv(switch_fd, recv_buffer, 4096, 0);
                     if (recv_size == -1) {
                         perror("recv");
                         return -1;
@@ -241,7 +249,22 @@ int main(int argc, char *argv[]) {
                     }
                     operation_type_t op = (operation_type_t)recv_buffer[0];
                     switch(op) {
+                        case RDMA_ONLINE: {
+                            engine->new_frontend_rdma_launched(recv_buffer + 1, flow_hash_map);
+                            break;
+                        }
+                        case RDMA_OFFLINE: {
+                            engine->frontend_rdma_offline(flow_hash_map);
+                        }
                         case UPDATE_RULE: {
+                            // recv_buffer[0]           recv_buffer[1]           recv_buffer[2]
+                            // [ 操作类型(op) ]      [新增规则个数(add_size)]    [删除规则个数(del_size)]
+                            // [新增规则1的d_index]  [规则1数据: mac][规则1数据: ip][规则1数据: port]
+                            // [新增规则2的d_index]  [规则2数据: mac][规则2数据: ip][规则2数据: port]
+                            // ...
+                            // [删除规则1的d_index]
+                            // [删除规则2的d_index]
+                            // ...
                             uint8_t add_size = recv_buffer[1];
                             uint8_t del_size = recv_buffer[2];
                             size_t now_bytes = 3;
@@ -267,6 +290,14 @@ int main(int argc, char *argv[]) {
                             break;
                         }
                         case UPDATE_D_INDEX: {
+                        // recv_buffer[0]           recv_buffer[1]           recv_buffer[2]
+                        // [ 操作类型(op) ]      [新增规则个数(add_size)]    [删除规则个数(del_size)]
+                        // [新增规则1的key字符串][规则1数据: d_index][规则1数据: offload_flag]
+                        // [新增规则2的key字符串][规则2数据: d_index][规则2数据: offload_flag]
+                        // ...
+                        // [删除规则1的key字符串]
+                        // [删除规则2的key字符串]
+                        // ...
                             uint8_t add_size = recv_buffer[1];
                             uint8_t del_size = recv_buffer[2];
                             size_t now_bytes = 3;
@@ -327,6 +358,23 @@ int main(int argc, char *argv[]) {
                         perror("rte_eth_stats_get");
                         return -1;
                     }
+
+                    engine->send_rdma_heartbeat(my_name);
+
+                    continue;
+
+                    std::cout<<"目前的规则内容："<<std::endl;
+                    for (auto it = rule_controller->rule_map.begin(); it != rule_controller->rule_map.end(); ++it) {
+                        std::cout << it->first << " " << it->second->d_index << " " << it->second->offload_flag << std::endl;
+                    }
+                    std::cout<<"后端服务器信息："<<std::endl;
+                    for (auto it = rule_controller->d_index_map.begin(); it != rule_controller->d_index_map.end(); ++it) {
+                        std::cout << it->first << " " << it->second->ip << " " << it->second->port << std::endl;
+                    }
+                    std::cout << "虚拟服务器信息"<< std::endl;
+                    std::cout << rule_controller->get_virtual_server_info()->ip <<std::endl;
+                    std::cout << rule_controller->get_virtual_server_info()->port <<std::endl;
+                    
                     std::cout << "Received packets:" << stats.ipackets << std::endl;
                     std::cout << "Sent packets:" << stats.opackets << std::endl;
                     std::cout << "Received bytes:" << stats.ibytes << std::endl;

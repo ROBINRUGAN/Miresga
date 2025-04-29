@@ -1,0 +1,11 @@
+{
+    "local_ip"                : "10.0.1.253",
+    "local_switch_port"       : 9999,
+    "switch_ip"               : "10.0.1.254",
+    "switch_port"             : 12345,
+    "pkt_processor_core_ids"  : [6, 10, 14, 18, 22, 26, 30],
+    "numa_node"               : "2",
+    "rdma_dev"                : "mlx5_5",
+    "name"               : "frontend2"
+}
+ 

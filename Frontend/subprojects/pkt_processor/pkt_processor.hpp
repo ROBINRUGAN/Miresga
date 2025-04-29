@@ -5,7 +5,9 @@
 #include "my_config.hpp"
 #include "flow_data.hpp"
 #include "rule_controller.hpp"
+#include "pkt_processor.hpp"
 #include "libcuckoo/cuckoohash_map.hh"
+#include "rdma/include/engine.hpp"
 extern "C" {
     #include <rte_eal.h>
     #include <rte_ethdev.h>
@@ -50,6 +52,7 @@ private:
     static rte_mempool *mbuf_pool;
     static rte_ether_addr source_mac;
     static rule_controller_t *rule_controller;
+    static rdma::Engine* engine;  // engine's copy!
     static dpdk_config_t *dpdk_config;
     static std::vector<uint8_t> crc8_table;
     static moodycamel::ConcurrentQueue<my_pair_t> *add_queue;
@@ -81,7 +84,9 @@ public:
                                          rule_controller_t *rule_controller, 
                                          moodycamel::ConcurrentQueue<my_pair_t> *add_queue,
                                          moodycamel::ConcurrentQueue<my_key_t> *del_queue,
-                                         libcuckoo::cuckoohash_map<uint64_t, flow_data_t *> *flow_hash_map);
+                                         libcuckoo::cuckoohash_map<uint64_t, flow_data_t *> *flow_hash_map,
+                                         rdma::Engine* engine
+                                         );
     static void destroy_static_variable();
     status_t status;
 };

@@ -6,13 +6,15 @@ libcuckoo_dep = libcuckoo_pro.dependency('libcuckoo')
 pkt_processor_inc = include_directories(['.', '../..', '..'])
 rule_controller_pro = subproject('rule_controller')
 rule_controller_dep = rule_controller_pro.get_variable('rule_controller_dep')
+rdma_pro = subproject('rdma')
+rdma_dep = rdma_pro.get_variable('rdma_dep')
 dpdk_dep = dependency('libdpdk', required: true)
 threads_dep = dependency('threads', required: true)
 
 
 pkt_processor_lib = shared_library('pkt_processor', 'pkt_processor.cpp', 
                                    install: true,
-                                   dependencies: [libcuckoo_dep, rule_controller_dep,  
+                                   dependencies: [libcuckoo_dep, rule_controller_dep, rdma_dep, 
                                                   dpdk_dep, threads_dep], 
                                    include_directories: pkt_processor_inc)
 pkt_processor_dep = declare_dependency(link_with: pkt_processor_lib, 

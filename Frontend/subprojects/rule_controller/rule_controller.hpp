@@ -22,7 +22,7 @@ public:
 };
 
 class rule_controller_t {
-private:
+public:
     std::unordered_map<std::string, my_data_t *> rule_map;
     std::unordered_map<uint8_t, server_info_t *> d_index_map;
     server_info_t *virtual_server_info;
