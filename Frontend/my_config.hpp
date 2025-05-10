@@ -21,6 +21,7 @@ enum operation_type_t {
     OFFLOAD_ENTRIES,
     RDMA_ONLINE,
     RDMA_OFFLINE,
+    QPN_FROM_REMOTE
 };
 
 #endif

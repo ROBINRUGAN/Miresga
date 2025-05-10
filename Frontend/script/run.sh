@@ -44,7 +44,7 @@ ip netns exec client arp -s 10.0.1.10 00:02:00:00:03:00 -i enp37s0f0
 # sudo mount -t bpf bpf /sys/fs/bpf
 # ./L7LB_Server --file-prefix=frontend1
 
-# sudo ip neigh del 10.0.1.254 dev enp197s0f1
+sudo ip neigh del 10.0.1.253 dev enp197s0f1
 
 # tofino
 sudo ip neigh replace 10.0.1.252 lladdr 02:8b:4e:f6:6b:4a dev enp4s0 nud permanent
@@ -57,6 +57,8 @@ sudo ip neigh add 10.0.1.0 lladdr b4:96:91:b1:d7:38 dev enp4s0 nud permanent
 # sudo ip neigh add 10.0.1.2 lladdr b4:96:91:db:d6:78 dev enp197s0f1 nud permanent
 # sudo ip neigh add 10.0.1.3 lladdr b4:96:91:db:d6:79 dev enp197s0f1 nud permanent
 sudo ip neigh replace 10.0.1.253 lladdr 4a:d8:44:30:e4:2c dev enp197s0f1v0 nud permanent
+
+sudo ip neigh replace fe80::e42:a1ff:fed1:d0c9 lladdr 0c:42:a1:d1:d0:c9 dev enp173s0f0 nud permanent
 
 
 # frontend2

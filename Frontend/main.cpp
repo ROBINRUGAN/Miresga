@@ -238,7 +238,7 @@ int main(int argc, char *argv[]) {
         if(nfds > 0) {
             for(int i = 0; i < nfds; i++) {
                 if(events[i].data.fd == switch_fd) {
-                    ssize_t recv_size = recv(switch_fd, recv_buffer, 4096, 0);
+                    ssize_t recv_size = recv(switch_fd, recv_buffer, 1, 0);
                     if (recv_size == -1) {
                         perror("recv");
                         return -1;
@@ -248,13 +248,27 @@ int main(int argc, char *argv[]) {
                         return -1;
                     }
                     operation_type_t op = (operation_type_t)recv_buffer[0];
+                    std::cout << "Operation type:" << (int)op << std::endl;
                     switch(op) {
                         case RDMA_ONLINE: {
+                            while (recv_size < 3109) {
+                                recv_size += recv(switch_fd, recv_buffer + recv_size, 3109 - recv_size, 0);
+                            }
                             engine->new_frontend_rdma_launched(recv_buffer + 1, flow_hash_map);
                             break;
                         }
                         case RDMA_OFFLINE: {
                             engine->frontend_rdma_offline(flow_hash_map);
+                            break;
+                        }
+                        case QPN_FROM_REMOTE: {
+                            // QPN_FROM_REMOTE + src_index + dst_index + remote_qpn
+                            // 1 + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t)
+                            while(recv_size < 13) {
+                                recv_size += recv(switch_fd, recv_buffer + recv_size, 13 - recv_size, 0);
+                            }
+                            engine->ready_to_receive_remote_qpn(recv_buffer + 1);
+                            break;
                         }
                         case UPDATE_RULE: {
                             // recv_buffer[0]           recv_buffer[1]           recv_buffer[2]
@@ -265,6 +279,10 @@ int main(int argc, char *argv[]) {
                             // [删除规则1的d_index]
                             // [删除规则2的d_index]
                             // ...
+                            while(recv_size < 180) {
+                                recv_size += recv(switch_fd, recv_buffer + recv_size, 180 - recv_size, 0);
+                            }
+                        
                             uint8_t add_size = recv_buffer[1];
                             uint8_t del_size = recv_buffer[2];
                             size_t now_bytes = 3;
@@ -286,6 +304,9 @@ int main(int argc, char *argv[]) {
                             break;
                         }
                         case UPDATE_V_INFO: {
+                            while(recv_size < sizeof(server_info_t) + 1) {
+                                recv_size += recv(switch_fd, recv_buffer + recv_size, sizeof(server_info_t) + 1 - recv_size, 0);
+                            }
                             rule_controller->update_virtual_server_info((server_info_t *)(recv_buffer + 1));
                             break;
                         }
@@ -298,9 +319,15 @@ int main(int argc, char *argv[]) {
                         // [删除规则1的key字符串]
                         // [删除规则2的key字符串]
                         // ...
+                            recv(switch_fd, recv_buffer + recv_size, 2, 0);
+                            recv_size += 2;
                             uint8_t add_size = recv_buffer[1];
                             uint8_t del_size = recv_buffer[2];
                             size_t now_bytes = 3;
+                            size_t total_size = 3 + add_size * (sizeof(server_info_t) + 1) + del_size;
+                            while(recv_size < total_size) {
+                                recv_size += recv(switch_fd, recv_buffer + recv_size, total_size - recv_size, 0);
+                            }
                             for(int i = 0; i < add_size; ++i) {
                                 uint8_t index = recv_buffer[now_bytes];
                                 now_bytes += 1;
