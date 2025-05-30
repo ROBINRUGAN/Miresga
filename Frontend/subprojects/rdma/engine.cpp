@@ -86,7 +86,7 @@ void rdma::Engine::serialize_crc_buffer(uint8_t crc, libcuckoo::cuckoohash_map<u
 
     uint32_t valid_len = offset - sizeof(uint32_t);
     memcpy(buf_ptr, &valid_len, sizeof(uint32_t));
-    // if (valid_len > 0)
+    if (valid_len > 0)
         std::cout << "Serialized buffer size: " << valid_len << std::endl;
 }
 
@@ -114,13 +114,15 @@ void rdma::Engine::update_from_crc_buffer(uint8_t crc, libcuckoo::cuckoohash_map
         flow_data->state = entry.state;
         flow_data->entry_data = entry.entry_data;
         flow_data->pkt_size = entry.pkt_size;
-        flow_data->recv_pkt = (char *)rte_malloc_socket("recv_pkt", entry.pkt_size, 0, 3);
-        memcpy(flow_data->recv_pkt, buf_ptr + offset, entry.pkt_size);
-        offset += entry.pkt_size;
-
+        if(entry.pkt_size > 0)
+        {
+            flow_data->recv_pkt = (char *)rte_malloc_socket("recv_pkt", entry.pkt_size, 0, 3);
+            memcpy(flow_data->recv_pkt, buf_ptr + offset, entry.pkt_size);
+            offset += entry.pkt_size;
+        }
         flow_hash_map[crc].insert_or_assign(entry.key, flow_data);
     }
-    printf("Updated flow_hash_map[%d] with %d entries\n", crc, valid_len);
+    printf("Updated flow_hash_map[%d] with %d valid length\n", crc, valid_len);
 }
 
 void rdma::Engine::frontend_rdma_offline(libcuckoo::cuckoohash_map<uint64_t, flow_data_t *> *flow_hash_map)
@@ -140,14 +142,14 @@ void rdma::Engine::send_rdma_heartbeat(std::string my_name)
     // return;
     for (int k = 0; k < rdma_info_nums; k++)
     {
-        if (rdma_info[k].valid == 0)
+        if (rdma_info[k].invalid != 0 || qp[k] == nullptr)
             continue;
         struct ibv_qp_attr attr;
         struct ibv_qp_init_attr init_attr;
         memset(&attr, 0, sizeof(attr));
         memset(&init_attr, 0, sizeof(init_attr));
         if (ibv_query_qp(qp[k], &attr, IBV_QP_STATE, &init_attr) == 0) {
-            std::cout << "QP current state: " << attr.qp_state << std::endl;
+            // std::cout << "QP current state: " << attr.qp_state << std::endl;
             if(attr.qp_state != IBV_QPS_RTS) {
                 std::cout << "QP state is not prepared, skipping heartbeat send" << std::endl;
                 continue;
@@ -216,21 +218,19 @@ void rdma::Engine::send_rdma_heartbeat(std::string my_name)
             std::cerr << "Heartbeat send failed for node " << failed_k
                       << ", wc.status = " << wc.status << "vendor_err= "<< wc.vendor_err << std::endl;
             
-            rdma_info[failed_k].valid = 0;
-            // rdma_info_nums--;
-            // struct ibv_qp_attr attr;
-            // attr.qp_state = IBV_QPS_RESET;
-
-            // if(ibv_modify_qp(qp[i], &attr, IBV_QP_STATE))
-            // {
-            //     std::cerr << "Failed to modify queue pair to RESET: errno=" << errno
-            //     << " (" << strerror(errno) << ")" << std::endl;
-            // }
+            rdma_info[failed_k].invalid = 1;
             
+            // notify tofino that this node k is offline
+            char send_buffer[64];
+            send_buffer[0] = 6;
+            memcpy(send_buffer + 1, &failed_k, sizeof(uint32_t));
+            if(send(switch_fd, send_buffer, sizeof(uint32_t) + 1, 0) <= 0) {
+                std::cerr << "Failed to send offline notification to switch" << std::endl;
+            }
         }
         else
         {
-            std::cout << "SUCCESSFUL heartbeat send for node " << (wc.wr_id >> 16) << std::endl;
+            // std::cout << "SUCCESSFUL heartbeat send for node " << (wc.wr_id >> 16) << std::endl;
         }
     }
 }
@@ -239,6 +239,8 @@ void rdma::Engine::send_rdma_buffer(uint8_t crc, libcuckoo::cuckoohash_map<uint6
 {
     for (int k = 0; k < rdma_info_nums; k++)
     {
+        if (rdma_info[k].invalid != 0 || qp[k] == nullptr)
+        continue;
         struct ibv_qp_attr attr;
         struct ibv_qp_init_attr init_attr;
         memset(&attr, 0, sizeof(attr));
@@ -316,19 +318,20 @@ void rdma::Engine::new_frontend_rdma_launched(char *buf, libcuckoo::cuckoohash_m
     ibv_gid remote_gid;
     uint64_t heartbeat_addr;
     uint32_t heartbeat_rkey;
-    // FRONTEND_ONLINE(4) + src_index + dst_index + data
+    // FRONTEND_ONLINE(4) + src_index + dst_index + invalid + data
     memcpy(&src_index, buf, sizeof(uint32_t));
     memcpy(&dst_index, buf + sizeof(uint32_t), sizeof(uint32_t));
-    memcpy(&remote_gid, buf + sizeof(uint32_t) + sizeof(uint32_t), sizeof(ibv_gid));
-    memcpy(&heartbeat_addr, buf + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(ibv_gid), sizeof(uint64_t));
-    memcpy(&heartbeat_rkey, buf + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(ibv_gid) + sizeof(uint64_t), sizeof(uint32_t));
+    memcpy(&invalid, buf + sizeof(uint32_t) + sizeof(uint32_t), sizeof(uint32_t));
+    memcpy(&remote_gid, buf + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t), sizeof(ibv_gid));
+    memcpy(&heartbeat_addr, buf + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(ibv_gid), sizeof(uint64_t));
+    memcpy(&heartbeat_rkey, buf + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t) + sizeof(ibv_gid) + sizeof(uint64_t), sizeof(uint32_t));
 
     rdma_info[src_index].remote_gid = remote_gid;
     rdma_info[src_index].heartbeat_addr = heartbeat_addr;
     rdma_info[src_index].heartbeat_rkey = heartbeat_rkey;
-    rdma_info[src_index].valid = 1;
+    rdma_info[src_index].invalid = invalid;
 
-    int offset =  sizeof(uint32_t) + sizeof(uint32_t) + sizeof(ibv_gid) + sizeof(uint64_t) + sizeof(uint32_t);
+    int offset =  sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t)+ sizeof(ibv_gid) + sizeof(uint64_t) + sizeof(uint32_t);
     for (int i = 0; i < 256; i++)
     {
         uint64_t buffer_addr;
@@ -340,11 +343,12 @@ void rdma::Engine::new_frontend_rdma_launched(char *buf, libcuckoo::cuckoohash_m
 
         rdma_info[src_index].crc_buffers[i].remote_buffer_addr = buffer_addr;
         rdma_info[src_index].crc_buffers[i].remote_rkey = buffer_rkey;
-        std::cout << "crc buffer " << i << " addr:" << std::hex << buffer_addr << std::dec << std::endl;
-        std::cout << "crc buffer " << i << " rkey:" << std::hex << buffer_rkey << std::dec << std::endl;
+        // std::cout << "crc buffer " << i << " addr:" << std::hex << buffer_addr << std::dec << std::endl;
+        // std::cout << "crc buffer " << i << " rkey:" << std::hex << buffer_rkey << std::dec << std::endl;
     }
 
-    rdma_info_nums++;
+    rdma_info_nums = (rdma_info_nums > src_index + 1) ? rdma_info_nums : src_index + 1;
+    rdma_info_nums = (rdma_info_nums > dst_index + 1) ? rdma_info_nums : dst_index + 1;
     std::cout << "Local gid:" << std::hex << _gid.global.interface_id  << std::dec << std::endl;
     std::cout << "ready to connect to remote gid:" << std::hex << remote_gid.global.interface_id << std::dec << std::endl;
     
@@ -472,15 +476,18 @@ void rdma::Engine::ready_to_receive_remote_qpn(char *buffer)
     std::cout << "Ready to send data" << std::endl;
 }
 
-void rdma::Engine::connect_to_tofino(int sock_fd)
+void rdma::Engine::connect_to_tofino(int sock_fd, libcuckoo::cuckoohash_map<uint64_t, flow_data_t *> *flow_hash_map)
 {
     switch_fd = sock_fd;
     std::cout << "Connect to all servers" << std::endl;
     for (int i = 0; i < 256; i++)
     {
         buffer[i] = new Buffer(1024, 8, 1536, 1, 2, _pd);
+        serialize_crc_buffer(i, flow_hash_map);
     }
     heartbeat = new Buffer(1024, 8, 1536, 1, 2, _pd);
+    printf("Init 256 buffers done\n");
+
 
     std::cout << "heartbeat addr:" << (uint64_t)heartbeat->get_addr() << std::endl;
     std::cout << "heartbeat rkey:" << heartbeat->get_rkey() << std::endl;

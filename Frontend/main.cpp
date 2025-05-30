@@ -88,7 +88,7 @@ int main(int argc, char *argv[]) {
     libcuckoo::cuckoohash_map<uint64_t, flow_data_t *> flow_hash_map[256];
     rdma::Engine* engine = new rdma::Engine(rdma_dev.c_str()); // 创建 RDMA 引擎对象，传入 RDMA 设备名称
 
-    
+     
     std::cout << "Rule controller initializing" << std::endl;
     rule_controller_t *rule_controller = new rule_controller_t;
     std::cout << "Rule controller initialized" << std::endl;
@@ -218,7 +218,7 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    engine->connect_to_tofino(switch_fd);
+    engine->connect_to_tofino(switch_fd, flow_hash_map);
 
 
     // 21. 进入主循环，通过 epoll_wait 同时监听交换机 FD 和两个定时器 FD
@@ -251,13 +251,18 @@ int main(int argc, char *argv[]) {
                     std::cout << "Operation type:" << (int)op << std::endl;
                     switch(op) {
                         case RDMA_ONLINE: {
-                            while (recv_size < 3109) {
-                                recv_size += recv(switch_fd, recv_buffer + recv_size, 3109 - recv_size, 0);
+                            while (recv_size < 3113) {
+                                recv_size += recv(switch_fd, recv_buffer + recv_size, 3113 - recv_size, 0);
                             }
+                            std::cout << "recv size:" << recv_size << std::endl;
                             engine->new_frontend_rdma_launched(recv_buffer + 1, flow_hash_map);
                             break;
                         }
                         case RDMA_OFFLINE: {
+                            while (recv_size < 5)
+                            {
+                                recv_size += recv(switch_fd, recv_buffer + recv_size, 5 - recv_size, 0);
+                            }
                             engine->frontend_rdma_offline(flow_hash_map);
                             break;
                         }

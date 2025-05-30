@@ -22,7 +22,7 @@ struct crc_buffers_t {
 
 struct rdma_info_t {
     ibv_gid remote_gid;
-    uint32_t valid;
+    uint32_t invalid;
     uint32_t remote_qpn;
     uint64_t heartbeat_addr;
     uint32_t heartbeat_rkey;
@@ -41,7 +41,6 @@ private:
     int rdma_info_nums = 1;
     Buffer* buffer[256];
     Buffer* heartbeat;
-
     ibv_qp *qp[1024];
     uint32_t local_qpn[1024];
 
@@ -57,7 +56,7 @@ public:
     Engine& operator=(Engine&&) = delete;
     Engine& operator=(const Engine&) = delete;
 
-    void connect_to_tofino(int sock_fd);
+    void connect_to_tofino(int sock_fd, libcuckoo::cuckoohash_map<uint64_t, flow_data_t *> *flow_hash_map);
     void send_rdma_heartbeat(std::string my_name);
     uint32_t create_qp(u_int32_t index);
     void ready_to_send_remote_qpn(uint32_t src_index, uint32_t dst_index);
